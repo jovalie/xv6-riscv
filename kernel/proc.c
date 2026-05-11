@@ -146,6 +146,9 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+  // Initialize the number of times info process has been called to 0
+  p->info_calls = 0;
+
   return p;
 }
 
