@@ -10,6 +10,8 @@ struct spinlock tickslock;
 uint ticks;
 
 extern char trampoline[], uservec[], userret[];
+// walking walk the process’s page table
+extern pte_t *walk(pagetable_t pagetable, uint64 va, int alloc);
 
 // in kernelvec.S, calls kerneltrap().
 void kernelvec();
@@ -67,9 +69,53 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } else if(r_scause() == 15) {
+    // Store page fault (write to a read-only page)
+    uint64 fault_va = r_stval();
+    
+    if(fault_va >= MAXVA) {
+      printf("Segmentation fault from process %d at address %p\n", p->pid, (void*)fault_va);
+      p->killed = 1;
+    } else {
+      // find page table entry for faulting address
+      pte_t *pte = walk(p->pagetable, fault_va, 0);
+      
+      // check if legitimate COW page
+      if(pte != 0 && (*pte & PTE_V) && (*pte & PTE_U) && (*pte & PTE_COW)) {
+        uint64 pa = PTE2PA(*pte);
+        uint flags = PTE_FLAGS(*pte);
+        
+        // clear COW flag and add Write permission
+        flags = (flags & ~PTE_COW) | PTE_W;
+        
+        char *mem = kalloc();
+        if(mem == 0) {
+          p->killed = 1; // Out of memory
+        } else {
+          // copy data from the old physical page to the new one
+          memmove(mem, (char*)pa, PGSIZE);
+          
+          uint64 fault_page = PGROUNDDOWN(fault_va);
+          
+          // unmap the old page with kfree()
+          uvmunmap(p->pagetable, fault_page, 1, 1);
+          
+          // map duplicated page into the process
+          if(mappages(p->pagetable, fault_page, PGSIZE, (uint64)mem, flags) != 0) {
+            kfree(mem);
+            p->killed = 1;
+          }
+        }
+      } else {
+        // fault occurred on a regular read-only page or unmapped memory
+        printf("Segmentation fault from process %d at address %p\n", p->pid, (void*)fault_va);
+        setkilled(p);
+      }
+    }
   } else {
-    printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
-    printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+    // printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
+    // printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+    printf("Segmentation fault from process %d at address %p\n", p->pid, (void*)r_stval());
     setkilled(p);
   }
 

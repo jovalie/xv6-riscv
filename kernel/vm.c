@@ -303,10 +303,7 @@ uvmfree(pagetable_t pagetable, uint64 sz)
   freewalk(pagetable);
 }
 
-// Given a parent process's page table, copy
-// its memory into a child's page table.
-// Copies both the page table and the
-// physical memory.
+// share the pages between the parent process and the child process
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
 int
@@ -315,26 +312,34 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
+    
     pa = PTE2PA(*pte);
+    
+    // if page writable, clear PTE_W and mark it as PTE_COW
+    if(*pte & PTE_W) {
+      *pte = (*pte & ~PTE_W) | PTE_COW;
+    }
+
+    // get flags of page table entry
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+
+    // map physical page into the child's page table
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
       goto err;
     }
+
+    // increment the reference count for this physical page
+    krefinc((void*)pa); 
   }
   return 0;
 
- err:
+err:
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
@@ -354,6 +359,7 @@ uvmclear(pagetable_t pagetable, uint64 va)
 
 // Copy from kernel to user.
 // Copy len bytes from src to virtual address dstva in a given page table.
+// Handles Copy-On-Write (COW) pages by allocating and mapping a new page before writing.
 // Return 0 on success, -1 on error.
 int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
@@ -365,11 +371,48 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     va0 = PGROUNDDOWN(dstva);
     if(va0 >= MAXVA)
       return -1;
+      
     pte = walk(pagetable, va0, 0);
-    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 ||
-       (*pte & PTE_W) == 0)
+    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
       return -1;
-    pa0 = PTE2PA(*pte);
+      
+    // handle Copy-On-Write (COW) pages directly within copyout.
+    // if the destination page is shared via COW, duplicate it before writing
+    if(*pte & PTE_COW) {
+      uint64 pa = PTE2PA(*pte); // Get the physical address of the shared page
+      uint flags = PTE_FLAGS(*pte);
+      
+      // clear COW flag and enable write permissions for the new page
+      flags = (flags & ~PTE_COW) | PTE_W;
+
+      // allocate a new physical page for the unique copy
+      char *mem = kalloc();
+      if(mem == 0)
+        return -1;
+
+      // copy existing data from shared page to the newly allocated page
+      memmove(mem, (char*)pa, PGSIZE);
+      
+      // unmap and decrement the old shared page
+      uvmunmap(pagetable, va0, 1, 1);
+
+      // map allocated page at the same virtual address with write permissions
+      if(mappages(pagetable, va0, PGSIZE, (uint64)mem, flags) != 0) {
+        kfree(mem);
+        return -1;
+      }
+      pa0 = (uint64)mem;
+    } else {
+      // ifnot a COW page, ensure the page has write perms
+      if((*pte & PTE_W) == 0)
+        return -1;
+        
+      // get physical address for standard copying
+      pa0 = walkaddr(pagetable, va0);
+      if(pa0 == 0)
+        return -1;
+    }
+
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
